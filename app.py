@@ -5,7 +5,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from estimate import estimate, load_runs, ratio_from_absorbances, read_absorbances, validate_runs
+from estimate import inverse_candidates, load_runs, ratio_from_absorbances, read_absorbances, validate_runs
+
+
+RUN_MODES = ("세 회차 비교", "1차", "2차", "3차")
+RUN_COLORS = ("#235f9d", "#a34d18", "#0b7363")
 
 
 class EstimatorApp(ttk.Frame):
@@ -13,7 +17,6 @@ class EstimatorApp(ttk.Frame):
 
     def __init__(self, master, runs=None):
         self.runs = load_runs() if runs is None else runs
-        self.reference = self.runs[2]
         self.validation = validate_runs(self.runs)
         super().__init__(master, padding=(20, 14), style="Page.TFrame")
         self._setup_styles()
@@ -22,9 +25,12 @@ class EstimatorApp(ttk.Frame):
         self.source_text = tk.StringVar(master=self, value="직접 입력")
         self.ratio_text = tk.StringVar(master=self, value="—")
         self.result_text = tk.StringVar(master=self, value="—")
+        self.run_mode = tk.StringVar(master=self, value=RUN_MODES[0])
+        self.candidate_texts = [tk.StringVar(master=self, value="—") for _ in self.runs]
         self.detail_text = tk.StringVar(master=self)
         self._updating_inputs = False
-        self._marker = None
+        self._ratio = None
+        self._solutions = {}
         self.grid(sticky="nsew")
         master.rowconfigure(0, weight=1)
         master.columnconfigure(0, weight=1)
@@ -33,6 +39,7 @@ class EstimatorApp(ttk.Frame):
         self._build()
         self.a434.trace_add("write", self._on_edit)
         self.a578.trace_add("write", self._on_edit)
+        self.run_mode.trace_add("write", lambda *_: self.update_result())
         self.update_result()
 
     def _setup_styles(self):
@@ -48,7 +55,7 @@ class EstimatorApp(ttk.Frame):
             ("Section.TLabel", 13, "#203d32", "#ffffff", "bold"),
             ("Text.TLabel", 10, "#273e35", "#ffffff", "normal"),
             ("Note.TLabel", 10, "#4a6056", "#ffffff", "normal"),
-            ("Result.TLabel", 21, "#006452", "#ffffff", "bold"),
+            ("Result.TLabel", 13, "#006452", "#ffffff", "bold"),
         ]:
             style.configure(name, background=bg, foreground=color, font=(family, size, weight))
         style.configure("Amount.TEntry", padding=(5, 4))
@@ -58,7 +65,7 @@ class EstimatorApp(ttk.Frame):
         header = ttk.Frame(self, style="Page.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         ttk.Label(header, text="NaCl 농도 추산기", style="Title.TLabel").grid(sticky="w")
-        ttk.Label(header, text="3차 Tris–mCP 실험의 여덟 농도를 기준으로 흡광도비에 대응하는 농도를 추산합니다.",
+        ttk.Label(header, text="흡광도비 R = A(578.3 nm) / A(434.2 nm)로 각 회차의 NaCl 농도 후보를 구합니다.",
                   style="Intro.TLabel").grid(sticky="w", pady=(2, 0))
 
         body = ttk.Frame(self, style="Page.TFrame")
@@ -87,29 +94,48 @@ class EstimatorApp(ttk.Frame):
         source = ttk.Label(inputs, textvariable=self.source_text, style="Note.TLabel", wraplength=240)
         source.grid(row=3, column=0, sticky="ew")
         source.bind("<Configure>", self._wrap_label)
+        ttk.Label(inputs, text="기준 곡선 · 빈 원은 보간 후보", style="Text.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(10, 0))
+        inputs.rowconfigure(5, weight=1)
+        self.chart = tk.Canvas(inputs, background="#ffffff", highlightthickness=0, width=220, height=115)
+        self.chart.grid(row=5, column=0, sticky="nsew")
+        self.chart.bind("<Configure>", lambda _event: self._draw_curve())
 
         result = ttk.Frame(body, padding=14, style="Card.TFrame")
         result.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         result.columnconfigure(0, weight=1)
-        result.rowconfigure(4, weight=1)
         ttk.Label(result, text="추산 결과", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        selector = ttk.Frame(result, style="Card.TFrame")
+        selector.grid(row=1, column=0, sticky="w", pady=(8, 4))
+        ttk.Label(selector, text="기준 회차", style="Text.TLabel").pack(side="left", padx=(0, 8))
+        ttk.Combobox(selector, textvariable=self.run_mode, values=RUN_MODES,
+                     state="readonly", width=13).pack(side="left")
         line = ttk.Frame(result, style="Card.TFrame")
-        line.grid(row=1, column=0, sticky="ew", pady=(3, 1))
-        ttk.Label(line, textvariable=self.result_text, style="Result.TLabel").pack(side="left")
-        ttk.Label(line, text="흡광도비 R", style="Note.TLabel").pack(side="left", padx=(12, 3))
+        line.grid(row=2, column=0, sticky="ew", pady=(3, 5))
+        ttk.Label(line, text="흡광도비 R", style="Note.TLabel").pack(side="left", padx=(0, 6))
         ttk.Label(line, textvariable=self.ratio_text, style="Text.TLabel").pack(side="left")
+        ttk.Label(result, textvariable=self.result_text, style="Result.TLabel").grid(row=3, column=0, sticky="w")
+        candidates = ttk.Frame(result, style="Card.TFrame")
+        candidates.grid(row=4, column=0, sticky="ew", pady=(3, 5))
+        candidates.columnconfigure(1, weight=1)
+        ttk.Label(candidates, text="기준 곡선", style="Note.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 14))
+        ttk.Label(candidates, text="가능한 NaCl 농도 (M)", style="Note.TLabel").grid(row=0, column=1, sticky="w")
+        self._candidate_rows = []
+        for i, var in enumerate(self.candidate_texts, 1):
+            label = ttk.Label(candidates, text=f"{i}차", style="Text.TLabel", foreground=RUN_COLORS[i-1])
+            label.grid(row=i, column=0, sticky="w")
+            values = ttk.Label(candidates, textvariable=var, style="Text.TLabel", wraplength=285)
+            values.grid(row=i, column=1, sticky="ew")
+            values.bind("<Configure>", self._wrap_label)
+            self._candidate_rows.append((label, values))
         details = ttk.Label(result, textvariable=self.detail_text, style="Note.TLabel", wraplength=420)
-        details.grid(row=2, column=0, sticky="ew")
+        details.grid(row=5, column=0, sticky="ew")
         details.bind("<Configure>", self._wrap_label)
-        ttk.Label(result, text="3차 기준 곡선", style="Text.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        self.chart = tk.Canvas(result, background="#ffffff", highlightthickness=0, width=250, height=145)
-        self.chart.grid(row=4, column=0, sticky="nsew")
-        self.chart.bind("<Configure>", lambda _event: self._draw_curve())
 
         checks = ttk.Frame(self, padding=(14, 10), style="Card.TFrame")
         checks.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         checks.columnconfigure(0, weight=1)
-        ttk.Label(checks, text="농도를 알고 있는 시료로 검증한 결과", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(checks, text="3차 곡선 검증", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         table = ttk.Treeview(checks, columns=("set", "covered", "mae"), show="headings",
                              height=len(self.validation), style="Validation.Treeview", selectmode="none")
         table.grid(row=1, column=0, sticky="ew", pady=(6, 5))
@@ -149,11 +175,24 @@ class EstimatorApp(ttk.Frame):
         self.source_text.set(source)
         self.update_result()
 
+    def _selected_indices(self):
+        mode_index = RUN_MODES.index(self.run_mode.get())
+        return range(len(self.runs)) if mode_index == 0 else (mode_index - 1,)
+
     def update_result(self):
         """입력 하나라도 지워지거나 유효하지 않으면 이전 추산과 그래프 표시를 지운다."""
-        self._marker = None
+        self._ratio = None
+        self._solutions = {}
+        selected = self._selected_indices()
         self.ratio_text.set("—")
         self.result_text.set("—")
+        for index, (var, widgets) in enumerate(zip(self.candidate_texts, self._candidate_rows)):
+            var.set("—")
+            for widget in widgets:
+                if index in selected:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
         if not self.a434.get().strip() or not self.a578.get().strip():
             self.detail_text.set("434.2 nm와 578.3 nm 흡광도를 모두 입력하세요.")
         else:
@@ -164,19 +203,36 @@ class EstimatorApp(ttk.Frame):
             else:
                 try:
                     ratio = ratio_from_absorbances(a434, a578)
-                    concentration = estimate(ratio, self.reference)
+                    solutions = {i: inverse_candidates(ratio, self.runs[i]) for i in selected}
                 except ValueError as exc:
                     self.detail_text.set(str(exc))
                 else:
                     self.ratio_text.set(f"{ratio:.3e}" if abs(ratio) >= 1_000 else f"{ratio:.5f}")
-                    if concentration is None:
-                        self.result_text.set("범위 밖")
-                        self.detail_text.set(f"3차 기준 흡광도비 {self.reference[0].ratio:.5f}–{self.reference[-1].ratio:.5f} 안에서만 추산합니다.")
+                    self._ratio, self._solutions = ratio, solutions
+                    for index, candidates in solutions.items():
+                        self.candidate_texts[index].set(self._format_candidates(candidates))
+                    if any(solutions.values()):
+                        self.result_text.set("보간 후보")
+                        self.detail_text.set("같은 흡광도비와 여러 농도가 대응하면 후보를 모두 표시합니다.")
                     else:
-                        self.result_text.set(f"{concentration:.2f} M")
-                        self.detail_text.set("3차 기준점 사이의 선형 보간값입니다.")
-                        self._marker = (concentration, ratio)
+                        self.result_text.set("기준 범위 밖")
+                        self.detail_text.set("선택한 기준 곡선에서는 이 흡광도비에 대응하는 농도를 보간할 수 없습니다.")
         self._draw_curve()
+
+    @staticmethod
+    def _format_candidates(candidates):
+        if not candidates:
+            return "범위 밖"
+        # Preserve close but distinct solutions when two decimal places would merge them.
+        bounds = {bound for interval in candidates for bound in interval}
+        for digits in (2, 3, 4, 5, 6):
+            formatted = {bound: f"{bound:.{digits}f}" for bound in bounds}
+            if len(set(formatted.values())) == len(bounds):
+                break
+        else:
+            formatted = {bound: str(bound) for bound in bounds}
+        return " · ".join(formatted[lo] if lo == hi else f"{formatted[lo]}–{formatted[hi]}"
+                           for lo, hi in candidates)
 
     def choose_csv(self):
         file = filedialog.askopenfilename(parent=self, title="Vernier 측정 CSV 선택",
@@ -195,8 +251,9 @@ class EstimatorApp(ttk.Frame):
         self._set_inputs(str(a434), str(a578), f"CSV · {Path(path).name}")
 
     def load_example(self):
-        point = self.reference[len(self.reference) // 2]
-        self._set_inputs(str(point.a434), str(point.a578), f"3차 기준 시료 예시 · 조제 농도 {point.concentration:.2f} M")
+        run = self.runs[2]
+        point = run[len(run) // 2]
+        self._set_inputs(str(point.a434), str(point.a578), "3차 측정값 예시")
 
     def _draw_curve(self):
         canvas = self.chart
@@ -205,18 +262,21 @@ class EstimatorApp(ttk.Frame):
         if w < 110 or h < 90:
             return
         x0, x1 = 44, w - 16
-        y0, y1 = 15, h - 31
-        left, right = self.reference[0].concentration, self.reference[-1].concentration
-        low, high = self.reference[0].ratio, self.reference[-1].ratio
-        yrange = high - low
-        low -= 0.07 * yrange
-        high += 0.07 * yrange
+        y0, y1 = 27, h - 31
+        selected = self._selected_indices()
+        points = [point for index in selected for point in self.runs[index]]
+        left = min(point.concentration for point in points)
+        right = max(point.concentration for point in points)
+        lowest = min(point.ratio for point in points)
+        highest = max(point.ratio for point in points)
+        margin = 0.07 * (highest - lowest) or 0.01
+        low, high = lowest - margin, highest + margin
 
         def project(concentration, ratio):
             return (x0 + (concentration-left)/(right-left)*(x1-x0), y1 - (ratio-low)/(high-low)*(y1-y0))
 
-        for i in range(3):
-            value = self.reference[0].ratio + yrange*i/2
+        tick_values = [lowest, (lowest + highest) / 2, highest] if lowest != highest else [lowest]
+        for value in tick_values:
             _, y = project(left, value)
             canvas.create_line(x0, y, x1, y, fill="#dbe5df")
             canvas.create_text(x0-6, y, anchor="e", text=f"{value:.2f}", fill="#486155")
@@ -226,14 +286,27 @@ class EstimatorApp(ttk.Frame):
             canvas.create_text(x, y1+3, anchor="n", text=f"{value:.1f}", fill="#486155")
         canvas.create_text(x0-2, y0-1, anchor="se", text="R", fill="#486155")
         canvas.create_text((x0+x1)/2, h-1, anchor="s", text="NaCl 농도 (M)", fill="#486155")
-        coords = [project(p.concentration,p.ratio) for p in self.reference]
-        canvas.create_line(*[xy for point in coords for xy in point], fill="#14745f", width=2)
-        for x,y in coords:
-            canvas.create_oval(x-2.5, y-2.5, x+2.5, y+2.5, fill="#14745f", outline="")
-        if self._marker is not None:
-            x, y = project(*self._marker)
-            canvas.create_line(x, y, x, y1, fill="#b2621e", dash=(3, 3))
-            canvas.create_oval(x-5, y-5, x+5, y+5, fill="#ffffff", outline="#ae5113", width=2)
+        if self._ratio is not None and any(self._solutions.values()):
+            _, y = project(left, self._ratio)
+            canvas.create_line(x0, y, x1, y, fill="#65736d", dash=(3, 3))
+        for slot, index in enumerate(selected):
+            color = RUN_COLORS[index]
+            x = x0 + slot * 40
+            canvas.create_line(x, 9, x + 9, 9, fill=color, width=2)
+            canvas.create_text(x + 12, 9, anchor="w", text=f"{index + 1}차", fill=color)
+            coords = [project(p.concentration, p.ratio) for p in self.runs[index]]
+            canvas.create_line(*[coordinate for point in coords for coordinate in point], fill=color, width=2)
+            for x, y in coords:
+                canvas.create_oval(x-2, y-2, x+2, y+2, fill=color, outline="")
+        for index, candidates in self._solutions.items():
+            color = RUN_COLORS[index]
+            for start, end in candidates:
+                x, y = project(start, self._ratio)
+                if start != end:
+                    x_end, _ = project(end, self._ratio)
+                    canvas.create_line(x, y, x_end, y, fill=color, width=4)
+                    canvas.create_oval(x_end-4, y-4, x_end+4, y+4, fill="#ffffff", outline=color, width=2)
+                canvas.create_oval(x-4, y-4, x+4, y+4, fill="#ffffff", outline=color, width=2)
 
 
 def main():

@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 
 from estimate import (
+    Point,
     estimate,
+    inverse_candidates,
     load_runs,
     ratio_from_absorbances,
     read_absorbances,
@@ -87,6 +89,56 @@ class CalibrationTests(unittest.TestCase):
         for value in (math.nan, math.inf, -math.inf):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 estimate(value, self.reference)
+
+    def test_all_inverse_candidates_for_the_first_run_zero_standard(self):
+        # Exact ratio of the measurements; truncation can move it outside run 1.
+        ratio = 1.8193373293737674 / 2.106442219282868
+        expected = [[0.0], [0.05383237, 0.59766541, 0.61701927], [0.88646215]]
+        for run_number, (run, want) in enumerate(zip(self.runs, expected), 1):
+            with self.subTest(run=run_number):
+                candidates = sorted(inverse_candidates(ratio, run))
+                self.assertEqual(len(candidates), len(want))
+                for (low, high), concentration in zip(candidates, want):
+                    self.assertAlmostEqual(low, concentration, places=7)
+                    self.assertAlmostEqual(high, concentration, places=7)
+
+    def test_shared_vertex_is_counted_once_and_outside_ratios_have_no_candidates(self):
+        run = [Point(0.0, 1.0, 1.0), Point(0.4, 1.0, 2.0), Point(0.6, 1.0, 1.0)]
+        self.assertEqual(inverse_candidates(2.0, run), [(0.4, 0.4)])
+        self.assertEqual(inverse_candidates(2.01, run), [])
+        self.assertEqual(inverse_candidates(0.99, run), [])
+
+    def test_scaling_both_absorbances_keeps_an_endpoint_or_turning_point(self):
+        for run in self.runs:
+            for point in run:
+                for scale in (0.1, 3, 7, 10):
+                    ratio = ratio_from_absorbances(point.a434 * scale, point.a578 * scale)
+                    candidates = inverse_candidates(ratio, run)
+                    self.assertTrue(any(lo <= point.concentration <= hi for lo, hi in candidates))
+
+    def test_adjacent_flat_segments_form_one_interval_alongside_isolated_roots(self):
+        ratios = [0.0, 2.0, 1.0, 1.0, 1.0, 0.0, 2.0]
+        run = [Point(float(i), 1.0, ratio) for i, ratio in enumerate(ratios)]
+        self.assertEqual(
+            sorted(inverse_candidates(1.0, run)),
+            [(0.5, 0.5), (2.0, 4.0), (5.5, 5.5)],
+        )
+
+    def test_file_names_and_common_absorbance_scale_do_not_change_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = []
+            for name, label, scale in [("0.00M.csv", "0M", 1), ("unknown.csv", "미지", 2)]:
+                path = Path(directory) / name
+                path.write_text(
+                    f"{label}:파장(nm),{label}:흡광도\n"
+                    f"434.2,{2.0 * scale}\n578.3,{1.76 * scale}\n",
+                    encoding="utf-8",
+                )
+                ratio = ratio_from_absorbances(*read_absorbances(path))
+                self.assertAlmostEqual(ratio, 0.88)
+                results.append([inverse_candidates(ratio, run) for run in self.runs])
+        self.assertTrue(all(results[0]))
+        self.assertEqual(results[0], results[1])
 
     def test_validation_coverage_and_mean_absolute_error(self):
         expected = [(6, 6, 0.05964645), (8, 8, 0.42548567), (4, 8, 0.50073708)]

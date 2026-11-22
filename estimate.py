@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import math
-from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -53,6 +52,38 @@ def load_runs() -> list[list[Point]]:
     return list(groups.values())
 
 
+def inverse_candidates(ratio: float, run: list[Point]) -> list[tuple[float, float]]:
+    """Return all intersections with a measured run, including flat intervals."""
+    if not math.isfinite(ratio):
+        raise ValueError("흡광도비는 유한한 값이어야 합니다.")
+    if len(run) < 2:
+        raise ValueError("회차별 기준점이 두 개 이상 필요합니다.")
+    # Scaling both input readings may shift their quotient by a few binary ULPs.
+    # Keep an endpoint or turning point from disappearing through roundoff alone.
+    nearest = min((p.ratio for p in run), key=lambda r: abs(r - ratio))
+    if abs(nearest - ratio) <= 4 * math.ulp(nearest):
+        ratio = nearest
+    candidates: list[tuple[float, float]] = []
+    for left, right in zip(run, run[1:]):
+        r0, r1 = left.ratio, right.ratio
+        if not min(r0, r1) <= ratio <= max(r0, r1):
+            continue
+        if r0 == r1:
+            low, high = left.concentration, right.concentration
+        elif ratio == r0:
+            low = high = left.concentration
+        elif ratio == r1:
+            low = high = right.concentration
+        else:
+            fraction = (ratio - r0) / (r1 - r0)
+            low = high = left.concentration + fraction * (right.concentration - left.concentration)
+        if candidates and low == candidates[-1][1]:
+            candidates[-1] = (candidates[-1][0], high)
+        else:
+            candidates.append((low, high))
+    return candidates
+
+
 def estimate(ratio: float, reference: list[Point]) -> float | None:
     """Invert a strictly increasing set of reference points without extrapolating."""
     if not math.isfinite(ratio):
@@ -62,12 +93,8 @@ def estimate(ratio: float, reference: list[Point]) -> float | None:
         raise ValueError("흡광도비가 순서대로 증가하는 기준점이 두 개 이상 필요합니다.")
     if ratio < ratios[0] or ratio > ratios[-1]:
         return None
-    upper = bisect_left(ratios, ratio)
-    if ratio == ratios[upper]:
-        return reference[upper].concentration
-    a, b = reference[upper - 1], reference[upper]
-    fraction = (ratio - a.ratio) / (b.ratio - a.ratio)
-    return a.concentration + fraction * (b.concentration - a.concentration)
+    candidates = inverse_candidates(ratio, reference)
+    return candidates[0][0] if candidates else None
 
 
 def validate_runs(runs: list[list[Point]]) -> list[tuple[str, int, int, float]]:
