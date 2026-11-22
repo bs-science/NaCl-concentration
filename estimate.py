@@ -1,17 +1,18 @@
-"""NaCl estimates from the 434.2 and 578.3 nm measurements of Tris–mCP samples."""
+"""Estimate added NaCl concentration from the third Tris–mCP experiment."""
 
 from __future__ import annotations
 
 import csv
 import io
 import math
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 
 
 REFERENCE_FILE = Path(__file__).with_name("reference.csv")
-RUN_DATES = ("20261029", "20261102", "20261105")
+RUN_DATE = "20261105"
 CONCENTRATIONS = (0.0, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 WAVELENGTHS = (434.2, 578.3)
 
@@ -38,83 +39,99 @@ class Point:
         return ratio_from_absorbances(self.a434, self.a578)
 
 
-def load_runs() -> list[list[Point]]:
-    groups = {day: [] for day in RUN_DATES}
-    with REFERENCE_FILE.open(encoding="utf-8-sig", newline="") as stream:
-        for row in csv.DictReader(stream):
-            groups[row["run_date"]].append(Point(
-                float(row["concentration_M"]), float(row["A434_2"]), float(row["A578_3"])
-            ))
-    for run in groups.values():
-        run.sort(key=lambda point: point.concentration)
-        if tuple(point.concentration for point in run) != CONCENTRATIONS:
-            raise ValueError("기준 파일의 농도 조건 8개를 확인하세요.")
-    return list(groups.values())
+def load_reference(path: Path | str = REFERENCE_FILE) -> list[Point]:
+    points = []
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"run_date", "concentration_M", "A434_2", "A578_3"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError("기준 파일의 날짜·농도·두 파장 흡광도 열을 확인하세요.")
+        for row in reader:
+            if row["run_date"] != RUN_DATE:
+                raise ValueError("기준 파일에는 2026-11-05의 3차 실험 자료만 사용할 수 있습니다.")
+            points.append(Point(float(row["concentration_M"]),
+                                float(row["A434_2"]), float(row["A578_3"])))
+    points.sort(key=lambda point: point.concentration)
+    if tuple(point.concentration for point in points) != CONCENTRATIONS:
+        raise ValueError("3차 기준 파일의 농도 조건 8개를 확인하세요.")
+    _validate_reference(points)
+    return points
 
 
-def inverse_candidates(ratio: float, run: list[Point]) -> list[tuple[float, float]]:
-    """Return all intersections with a measured run, including flat intervals."""
-    if not math.isfinite(ratio):
-        raise ValueError("흡광도비는 유한한 값이어야 합니다.")
-    if len(run) < 2:
-        raise ValueError("회차별 기준점이 두 개 이상 필요합니다.")
-    # Scaling both input readings may shift their quotient by a few binary ULPs.
-    # Keep an endpoint or turning point from disappearing through roundoff alone.
-    nearest = min((p.ratio for p in run), key=lambda r: abs(r - ratio))
-    if abs(nearest - ratio) <= 4 * math.ulp(nearest):
-        ratio = nearest
-    candidates: list[tuple[float, float]] = []
-    for left, right in zip(run, run[1:]):
-        r0, r1 = left.ratio, right.ratio
-        if not min(r0, r1) <= ratio <= max(r0, r1):
-            continue
-        if r0 == r1:
-            low, high = left.concentration, right.concentration
-        elif ratio == r0:
-            low = high = left.concentration
-        elif ratio == r1:
-            low = high = right.concentration
-        else:
-            fraction = (ratio - r0) / (r1 - r0)
-            low = high = left.concentration + fraction * (right.concentration - left.concentration)
-        if candidates and low == candidates[-1][1]:
-            candidates[-1] = (candidates[-1][0], high)
-        else:
-            candidates.append((low, high))
-    return candidates
+def _validate_reference(reference: list[Point]) -> list[float]:
+    if len(reference) < 2:
+        raise ValueError("기준점이 두 개 이상 필요합니다.")
+    if any(not math.isfinite(p.concentration) for p in reference):
+        raise ValueError("기준 농도가 유한한 값이어야 합니다.")
+    if any(a.concentration >= b.concentration for a, b in zip(reference, reference[1:])):
+        raise ValueError("기준 농도가 순서대로 증가해야 합니다.")
+    ratios = [point.ratio for point in reference]
+    if any(a >= b for a, b in zip(ratios, ratios[1:])):
+        raise ValueError("기준 흡광도비가 순서대로 증가해야 합니다.")
+    return ratios
 
 
 def estimate(ratio: float, reference: list[Point]) -> float | None:
-    """Invert a strictly increasing set of reference points without extrapolating."""
+    """Piecewise linear inverse interpolation within the measured ratio range."""
     if not math.isfinite(ratio):
         raise ValueError("흡광도비는 유한한 값이어야 합니다.")
-    ratios = [point.ratio for point in reference]
-    if len(reference) < 2 or any(lo >= hi for lo, hi in zip(ratios, ratios[1:])):
-        raise ValueError("흡광도비가 순서대로 증가하는 기준점이 두 개 이상 필요합니다.")
+    ratios = _validate_reference(reference)
+    # Equivalent scaled inputs may differ at endpoints by binary roundoff.
+    nearest = min(ratios, key=lambda value: abs(value - ratio))
+    if abs(nearest - ratio) <= 4 * math.ulp(nearest):
+        ratio = nearest
     if ratio < ratios[0] or ratio > ratios[-1]:
         return None
-    candidates = inverse_candidates(ratio, reference)
-    return candidates[0][0] if candidates else None
+    upper = bisect_left(ratios, ratio)
+    if ratio == ratios[upper]:
+        return reference[upper].concentration
+    a, b = reference[upper - 1], reference[upper]
+    fraction = (ratio - a.ratio) / (b.ratio - a.ratio)
+    return a.concentration + fraction * (b.concentration - a.concentration)
 
 
-def validate_runs(runs: list[list[Point]]) -> list[tuple[str, int, int, float]]:
-    ref = runs[2]
-    results = []
-    internal = []
-    for index in range(1, len(ref) - 1):
-        point = ref[index]
-        predicted = estimate(point.ratio, ref[:index] + ref[index + 1:])
-        assert predicted is not None  # An omitted interior point is still bracketed.
-        internal.append(abs(predicted - point.concentration))
-    results.append(("3차 내부 보간", len(internal), len(internal), mean(internal)))
-    for label, run in zip(("1차 자료", "2차 자료"), runs[:2]):
-        errors = []
-        for point in run:
-            predicted = estimate(point.ratio, ref)
-            if predicted is not None:
-                errors.append(abs(predicted - point.concentration))
-        results.append((label, len(errors), len(run), mean(errors) if errors else math.nan))
-    return results
+@dataclass(frozen=True)
+class ValidationPoint:
+    actual: float
+    predicted: float
+
+    @property
+    def error(self) -> float:
+        return self.predicted - self.actual
+
+
+@dataclass(frozen=True)
+class Validation:
+    samples: tuple[ValidationPoint, ...]
+    total: int
+    excluded_endpoints: int
+
+    @property
+    def mae(self) -> float:
+        return mean(abs(point.error) for point in self.samples)
+
+    @property
+    def rmse(self) -> float:
+        return math.sqrt(mean(point.error ** 2 for point in self.samples))
+
+    @property
+    def max_error(self) -> float:
+        return max(abs(point.error) for point in self.samples)
+
+
+def validate_reference(reference: list[Point]) -> Validation:
+    """Leave one interior concentration out at a time; never score a training fit."""
+    _validate_reference(reference)
+    if len(reference) < 3:
+        raise ValueError("내부 검증에 기준점이 세 개 이상 필요합니다.")
+    samples = []
+    for index in range(1, len(reference) - 1):
+        point = reference[index]
+        predicted = estimate(point.ratio, reference[:index] + reference[index + 1:])
+        assert predicted is not None  # Retained neighbours bracket every interior point.
+        samples.append(ValidationPoint(point.concentration, predicted))
+    return Validation(tuple(samples), len(reference), 2)
+
 
 
 def read_absorbances(path: Path | str) -> tuple[float, float]:
