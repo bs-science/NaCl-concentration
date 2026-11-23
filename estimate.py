@@ -10,11 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import brentq
+
 
 REFERENCE_FILE = Path(__file__).with_name("reference.csv")
 RUN_DATE = "20261105"
 CONCENTRATIONS = (0.0, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 WAVELENGTHS = (434.2, 578.3)
+BASELINE_WAVELENGTH = 730.1
 
 
 def ratio_from_absorbances(a434: float, a578: float) -> float:
@@ -33,10 +37,24 @@ class Point:
     concentration: float
     a434: float
     a578: float
+    a730: float | None = None
 
     @property
     def ratio(self) -> float:
         return ratio_from_absorbances(self.a434, self.a578)
+
+
+def baseline_correct(point: Point) -> Point:
+    """Remove a measured constant optical offset; this is not a matrix blank."""
+    if point.a730 is None or not math.isfinite(point.a730):
+        raise ValueError("바탕선 보정에는 유한한 730.1 nm 흡광도가 필요합니다.")
+    corrected = Point(point.concentration, point.a434 - point.a730,
+                      point.a578 - point.a730)
+    try:
+        corrected.ratio
+    except ValueError as exc:
+        raise ValueError("바탕선 보정 후 흡광도가 유효하지 않습니다. 측정값을 확인하세요.") from exc
+    return corrected
 
 
 def load_reference(path: Path | str = REFERENCE_FILE) -> list[Point]:
@@ -50,7 +68,8 @@ def load_reference(path: Path | str = REFERENCE_FILE) -> list[Point]:
             if row["run_date"] != RUN_DATE:
                 raise ValueError("기준 파일에는 2026-11-05의 3차 실험 자료만 사용할 수 있습니다.")
             points.append(Point(float(row["concentration_M"]),
-                                float(row["A434_2"]), float(row["A578_3"])))
+                                float(row["A434_2"]), float(row["A578_3"]),
+                                float(row["A730_1"]) if row.get("A730_1") else None))
     points.sort(key=lambda point: point.concentration)
     if tuple(point.concentration for point in points) != CONCENTRATIONS:
         raise ValueError("3차 기준 파일의 농도 조건 8개를 확인하세요.")
@@ -71,11 +90,18 @@ def _validate_reference(reference: list[Point]) -> list[float]:
     return ratios
 
 
+def calibration_curve(reference: list[Point]) -> PchipInterpolator:
+    """Interpolate R as a monotone function of concentration, without extrapolation."""
+    ratios = _validate_reference(reference)
+    return PchipInterpolator([p.concentration for p in reference], ratios, extrapolate=False)
+
+
 def estimate(ratio: float, reference: list[Point]) -> float | None:
-    """Piecewise linear inverse interpolation within the measured ratio range."""
+    """Invert the forward PCHIP calibration within the measured ratio range."""
     if not math.isfinite(ratio):
         raise ValueError("흡광도비는 유한한 값이어야 합니다.")
-    ratios = _validate_reference(reference)
+    curve = calibration_curve(reference)
+    ratios = [point.ratio for point in reference]
     # Equivalent scaled inputs may differ at endpoints by binary roundoff.
     nearest = min(ratios, key=lambda value: abs(value - ratio))
     if abs(nearest - ratio) <= 4 * math.ulp(nearest):
@@ -86,8 +112,8 @@ def estimate(ratio: float, reference: list[Point]) -> float | None:
     if ratio == ratios[upper]:
         return reference[upper].concentration
     a, b = reference[upper - 1], reference[upper]
-    fraction = (ratio - a.ratio) / (b.ratio - a.ratio)
-    return a.concentration + fraction * (b.concentration - a.concentration)
+    return float(brentq(lambda concentration: float(curve(concentration)) - ratio,
+                        a.concentration, b.concentration, xtol=1e-12))
 
 
 @dataclass(frozen=True)
@@ -134,8 +160,9 @@ def validate_reference(reference: list[Point]) -> Validation:
 
 
 
-def read_absorbances(path: Path | str) -> tuple[float, float]:
+def read_absorbances(path: Path | str, include_baseline: bool = False) -> tuple[float, ...]:
     """Read one Vernier wavelength–absorbance series, including empty trailing pairs."""
+    wavelengths = WAVELENGTHS + ((BASELINE_WAVELENGTH,) if include_baseline else ())
     data = Path(path).read_bytes()
     try:
         text = data.decode("utf-8-sig")
@@ -169,7 +196,7 @@ def read_absorbances(path: Path | str) -> tuple[float, float]:
                 raise ValueError("파장 열에 숫자가 아닌 값이 있습니다.") from exc
             if not math.isfinite(wave):
                 raise ValueError("파장 열에 유한하지 않은 값이 있습니다.")
-            for target in WAVELENGTHS:
+            for target in wavelengths:
                 if math.isclose(wave, target, rel_tol=0, abs_tol=0.001):
                     if target in found:
                         raise ValueError(f"{target} nm 측정값이 중복됩니다. 단일 스펙트럼을 선택하세요.")
@@ -177,9 +204,12 @@ def read_absorbances(path: Path | str) -> tuple[float, float]:
                         found[target] = float(row[idx + 1])
                     except ValueError as exc:
                         raise ValueError(f"{target} nm 흡광도를 숫자로 읽을 수 없습니다.") from exc
-    missing = [str(wave) for wave in WAVELENGTHS if wave not in found]
+    missing = [str(wave) for wave in wavelengths if wave not in found]
     if missing:
         raise ValueError(f"기준 파장 {', '.join(missing)} nm의 측정값이 없습니다.")
-    a434, a578 = (found[wave] for wave in WAVELENGTHS)
+    values = tuple(found[wave] for wave in wavelengths)
+    a434, a578 = values[:2]
     ratio_from_absorbances(a434, a578)
-    return a434, a578
+    if include_baseline and not math.isfinite(values[2]):
+        raise ValueError("730.1 nm 흡광도에는 유한한 값이 필요합니다.")
+    return values
